@@ -49,10 +49,10 @@ object Main {
 
     /*val httpRequest = HttpRequest(uri = "https://api.github.com/orgs/ScalaConsultants/repos")
       .withHeaders(RawHeader("Accept", "application/vnd.github.v3+json"),
-        Authorization(GenericHttpCredentials("token", "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")))*/
+        Authorization(GenericHttpCredentials("token", "")))*/
 
     val GITHUB_HEADER = RawHeader("Accept", "application/vnd.github.v3+json")
-    val AUTH_HEADER = Authorization(GenericHttpCredentials("token", System.getenv("GH_TOKEN")))
+    val AUTH_HEADER = Authorization(GenericHttpCredentials("token", scala.sys.env("GH_TOKEN")))
 
     case class HttpResponseException(code: StatusCode) extends Throwable
     case class UnmarshalResponseException(msg: String) extends Throwable
