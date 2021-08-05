@@ -1,118 +1,140 @@
 package io.scalac.githubrank
 
-import akka.actor.typed.ActorSystem
+import akka.actor.typed.{ActorRef, ActorSystem, Behavior}
 import akka.actor.typed.scaladsl.Behaviors
 import akka.http.scaladsl.Http
 import org.slf4j.LoggerFactory
 import akka.http.scaladsl.client.RequestBuilding._
-import akka.http.scaladsl.model.HttpHeader
+import akka.http.scaladsl.model.{HttpHeader, HttpRequest, ResponseEntity, StatusCode, StatusCodes}
 import akka.http.scaladsl.model.HttpProtocols._
 import akka.http.scaladsl.model.MediaTypes._
 import akka.http.scaladsl.model.HttpCharsets._
 import akka.http.scaladsl.model.HttpMethods._
-import akka.http.scaladsl.model.headers.{Authorization, GenericHttpCredentials, RawHeader}
+import akka.http.scaladsl.model.headers.{Authorization, ETag, EntityTag, GenericHttpCredentials, RawHeader}
 import akka.http.scaladsl.unmarshalling.Unmarshal
-import akka.stream.scaladsl.Sink
-import akka.util.ByteString
+import akka.stream.scaladsl.{Keep, Sink, Source}
+import akka.util.{ByteString, Timeout}
 import spray.json._
 import DefaultJsonProtocol._
+import akka.{Done, NotUsed}
+import akka.stream.contrib.PagedSource
 
+import scala.collection.concurrent.TrieMap
 import scala.concurrent.{Await, Future}
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration.{Duration, DurationInt}
+import scala.language.postfixOps
 import scala.util.{Failure, Success, Try}
 
 object Main {
+
+  /*sealed trait Command
+
+  case class Get(url: String, sender: ActorRef[ResponseEntity]) extends Command
+
+  def rateLimitedAPIConsumer(): Behavior[Command] = Behaviors.setup { ctx =>
+
+    Behaviors.receive {
+      case _ => Behaviors.same
+    }
+  }*/
 
   def main(args: Array[String]): Unit = {
 
     val logger = LoggerFactory.getLogger(this.getClass)
 
-    val GitHubHeader = RawHeader("Accept", "application/vnd.github.v3+json")
-    val AuthHeader = Authorization(GenericHttpCredentials("token", "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"))
+    implicit val actorSystem = ActorSystem.create[Nothing](Behaviors.empty[Nothing], "alpakka-samples")
+    import actorSystem.executionContext
 
-    implicit val system = ActorSystem.create[Nothing](Behaviors.empty[Nothing], "GitHubClient")
-    implicit val ec = system.executionContext
+    val pageSize        = 100
+
+    /*val httpRequest = HttpRequest(uri = "https://api.github.com/orgs/ScalaConsultants/repos")
+      .withHeaders(RawHeader("Accept", "application/vnd.github.v3+json"),
+        Authorization(GenericHttpCredentials("token", "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")))*/
+
+    val GITHUB_HEADER = RawHeader("Accept", "application/vnd.github.v3+json")
+    val AUTH_HEADER = Authorization(GenericHttpCredentials("token", "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"))
+
+    case class HttpResponseException(code: StatusCode) extends Throwable
+    case class UnmarshalResponseException(msg: String) extends Throwable
+    case class HttpConnectionException(msg: String) extends Throwable
+
+    case class MyURI(url: String, page: Int)
 
     case class Repository(name: String, full_name: String)
     case class Contribution(login: String, contributions: Int)
 
     implicit val repositoryFormat = jsonFormat2(Repository)
     implicit val contributorFormat = jsonFormat2(Contribution)
+    implicit val timeout = Timeout(5 seconds)
 
-    val http = Http()
+    def getPagedSource(url: MyURI) = {
+      PagedSource[JsArray, MyURI](url){ case nextPageUri =>
 
-    def getContributorsByRepo(repo: Repository, page: Int): Future[Seq[Contribution]] = {
-      val request =
-        Get(s"https://api.github.com/repos/${repo.full_name}/contributors?page=$page&per_page=50")
-          .withHeaders(Seq(
-            GitHubHeader
-          ))
+        println(s"${Console.GREEN_B}PROCESSING NEXT PAGE ${nextPageUri}${Console.RESET}")
 
-      println(s"checking contributions for repo ${repo}")
+        Http()
+          .singleRequest(HttpRequest(uri = s"${nextPageUri.url}?page=${nextPageUri.page}&per_page=$pageSize")
+            .withHeaders(GITHUB_HEADER, AUTH_HEADER))
+          .flatMap {
+            case httpResponse if httpResponse.status != StatusCodes.OK =>
+              //throw HttpResponseException(httpResponse.status)
+              Future.successful(PagedSource.Page(
+                Seq.empty[JsArray],
+                  Some(MyURI(url.url, nextPageUri.page + 1)
+                )))
 
-      http.singleRequest(request).flatMap(response => Unmarshal(response.entity).to[ByteString]
-        .map(_.utf8String.parseJson.convertTo[Seq[Contribution]]))
-    }
-
-    def getAllContributorsByRepo(repo: Repository, page: Int = 1): Future[Seq[Contribution]] = {
-      getContributorsByRepo(repo, page).flatMap {
-        case list if list.isEmpty => Future.successful(list)
-        case list => getAllContributorsByRepo(repo, page + 1).map(list ++ _)
+            case httpResponse =>
+              Unmarshal(httpResponse)
+                .to[ByteString].map(_.utf8String.parseJson.convertTo[JsArray])
+                .map { response =>
+                  PagedSource.Page(
+                    Seq(response),
+                    if (response.elements.isEmpty) None
+                    else Some(MyURI(url.url, nextPageUri.page + 1))
+                  )
+                }
+                .recover {
+                  case ex =>
+                    throw UnmarshalResponseException(ex.getMessage)
+                }
+          }
+          .recover {
+            case ex: HttpResponseException      => throw ex
+            case ex: UnmarshalResponseException => throw ex
+            case ex                             => throw HttpConnectionException(ex.getMessage)
+          }
       }
     }
 
-    def getReposByOrg(org: String, page: Int): Future[Seq[Repository]] = {
-      val request =
-        Get(s"https://api.github.com/orgs/$org/repos?page=$page&per_page=50")
-          .withHeaders(Seq(
-            GitHubHeader,
-            AuthHeader
-          ))
+    val org = "spray"
+    val repos = getPagedSource(MyURI(s"https://api.github.com/orgs/${org}/repos", page = 1))
 
-      http.singleRequest(request).flatMap(response => Unmarshal(response.entity).to[ByteString].map(_.utf8String.parseJson.convertTo[Seq[Repository]]))
+    def lookupContributors(repos: Seq[Repository]) = {
+      Source(repos)
+        .flatMapConcat(repo => getPagedSource(MyURI(s"https://api.github.com/repos/${repo.full_name}/contributors", page = 1))
+          .map(_.convertTo[Seq[Contribution]]))
     }
 
-    def getAllReposByOrg(org: String, page: Int = 1): Future[Seq[Repository]] = {
-      getReposByOrg(org, page).flatMap {
-        case list if list.isEmpty => Future.successful(list)
-        case list => getAllReposByOrg(org, page + 1).map(list ++ _)
-      }
+    val future =
+      repos.map(_.convertTo[Seq[Repository]])
+        .flatMapMerge(10, x => lookupContributors(x))
+      .throttle(5000, 1 hour)
+      .runWith(Sink.seq[Seq[Contribution]])
+
+    future.onComplete {
+      case Success(value) =>
+
+        // Flatten all contributions grabbed, group by user and then sort in reversing order
+        val contributions = value.flatten.groupBy(_.login).map{case (user, list) => user -> list.map(_.contributions).sum}.toSeq.sortBy(_._2).reverse
+
+        println(contributions)
+
+        actorSystem.terminate()
+
+      case Failure(ex) =>
+        //ex.printStackTrace()
+        actorSystem.terminate()
     }
-
-    /*(for {
-        response <- Http().singleRequest(request)
-        entity <- Unmarshal(response.entity).to[ByteString].map(_.utf8String.parseJson)
-      } yield entity).onComplete {
-      case Success(json) =>
-
-        //logger.info(s"response: ${json.prettyPrint}\n")
-
-        println(json.prettyPrint)
-
-        system.terminate()
-
-      case Failure(ex) => logger.error(ex.getMessage)
-    }*/
-
-    getAllReposByOrg("ScalaConsultants").onComplete {
-      case Success(repos) =>
-
-        //logger.info(s"response: ${json.prettyPrint}\n")
-
-        Future.sequence(repos.map(r => getAllContributorsByRepo(r).map(r -> _))).onComplete {
-          case Success(list) =>
-
-            println(list)
-
-            system.terminate()
-
-          case Failure(ex) => throw ex
-        }
-
-      case Failure(ex) => logger.error(ex.getMessage)
-    }
-
-    Await.ready(system.whenTerminated, Duration.Inf)
 
   }
 
