@@ -52,7 +52,7 @@ object Main {
         Authorization(GenericHttpCredentials("token", "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")))*/
 
     val GITHUB_HEADER = RawHeader("Accept", "application/vnd.github.v3+json")
-    val AUTH_HEADER = Authorization(GenericHttpCredentials("token", "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"))
+    val AUTH_HEADER = Authorization(GenericHttpCredentials("token", System.getenv("GH_TOKEN")))
 
     case class HttpResponseException(code: StatusCode) extends Throwable
     case class UnmarshalResponseException(msg: String) extends Throwable
