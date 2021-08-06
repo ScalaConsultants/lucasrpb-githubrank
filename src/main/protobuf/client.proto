@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+import "protocol.proto";
+
+package io.scalac.githubrank.grpc;
+//#options
+
+//#services
+/*service CommanderClient {
+  rpc sendCommand (CommandRequest) returns (CommandResponse) {}
+  rpc read(ReadRequest) returns(ReadResponse) {}
+}*/
+//#services

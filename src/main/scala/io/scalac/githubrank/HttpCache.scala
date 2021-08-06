@@ -1,51 +1,71 @@
 package io.scalac.githubrank
 
-import akka.actor.typed.scaladsl.AskPattern.Askable
-import akka.actor.typed.scaladsl.Behaviors
-import akka.actor.typed.{ActorRef, ActorSystem, Behavior}
-import akka.http.scaladsl.model.ResponseEntity
-import akka.util.Timeout
+import com.github.benmanes.caffeine.cache.{CacheLoader, Caffeine, RemovalCause}
+import com.google.protobuf.any.Any
+import io.scalac.githubrank.grpc._
+import org.mapdb.{DBMaker, Serializer}
+import org.slf4j.LoggerFactory
 
-import scala.collection.concurrent.TrieMap
-import scala.concurrent.Future
+import java.util.concurrent.Executor
+import scala.concurrent.ExecutionContext
 
-object HttpCache {
+/**
+ * This is an implementation of an in-memory and persistent cache for the Http ETag cache supported by the GitHub API
+ * When the GitHub API returns a response code 304 (Not Modified), the data is fetched from the local cache, thus not
+ * increasing the rate request limit of the GitHub API! :)
+ * @param MAX_ENTRIES Number of max entries in the cache
+ * @param ec
+ */
+class HttpCache(val MAX_ENTRIES: Int)(implicit val ec: ExecutionContext)  {
 
-  sealed trait Command
-  protected case class GetItem(url: String, sender: ActorRef[Option[(String, String, ResponseEntity)]]) extends Command
-  protected case class PutItem(url: String, data: (String, String, ResponseEntity), sender: ActorRef[Boolean]) extends Command
+  protected val db = DBMaker.fileDB("db")
+    .transactionEnable()
+    .closeOnJvmShutdown()
+    .make()
 
-  def apply(): Behavior[Command] = Behaviors.setup { ctx =>
-    val cache = TrieMap.empty[String, (String, String, ResponseEntity)]
+  val entitiesCollection = db.treeMap("responses_cache")
+    .keySerializer(Serializer.STRING)
+    .valueSerializer(Serializer.BYTE_ARRAY)
+    .createOrOpen()
 
-    Behaviors.receiveMessage {
-      case GetItem(url, sender) =>
-        sender ! cache.get(url)
-        Behaviors.same
+  val logger = LoggerFactory.getLogger(this.getClass)
 
-      case PutItem(url, data, sender) =>
-        cache.put(url, data)
-        sender ! true
-        Behaviors.same
+  val cache = Caffeine.newBuilder()
+    .maximumSize(MAX_ENTRIES)
+    .executor(ec.asInstanceOf[Executor])
+    .removalListener((key: String, value: CacheItem, cause: RemovalCause) => {
+      if(cause.wasEvicted())
+        logger.debug(s"REMOVING ${key} FROM CACHE $cause\n")
+    })
+    .build[String, CacheItem](
+      // This code loads the cached response for an URL (if not in memory) from the file database
+      new CacheLoader[String, CacheItem] {
+        override def load(key: String): CacheItem = entitiesCollection.get(key) match {
+          case res if res == null => null
+          case res =>
 
-      case _ => Behaviors.same
+            val item = Any.parseFrom(res).unpack(CacheItem)
+
+            logger.info(s"reading from db: ${item}")
+
+            item
+        }
+    })
+
+  def put(key: String, value: CacheItem): Unit = synchronized {
+    cache.put(key, value)
+    entitiesCollection.put(key, Any.pack(value).toByteArray)
+  }
+
+  def get(key: String): Option[CacheItem] = {
+    cache.get(key) match {
+      case res if res == null => None
+      case res => Some(res)
     }
   }
 
-  val system = ActorSystem.create[Command](apply(), "GithubCache")
-  implicit val sc = system.scheduler
-  implicit val ec = system.executionContext
-
-  def get(url: String)(implicit timeout: Timeout): Future[Option[(String, String, ResponseEntity)]] = {
-    system.ask[Option[(String, String, ResponseEntity)]] { sender =>
-      GetItem(url, sender)
-    }
-  }
-
-  def put(url: String, data: (String, String, ResponseEntity))(implicit timeout: Timeout): Future[Boolean] = {
-    system.ask[Boolean] { sender =>
-      PutItem(url, data, sender)
-    }
+  def close(): Unit = {
+    db.close()
   }
 
 }
