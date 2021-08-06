@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package io.scalac.githubrank.grpc;
+
+message CacheItem {
+  string tag = 1;
+  string lastModified = 2;
+  bytes entity = 3;
+}
